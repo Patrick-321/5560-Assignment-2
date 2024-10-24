@@ -1,49 +1,70 @@
-# setup-the resource
-
 import boto3
 import time
-from boto3 import dynamodb
+from botocore.exceptions import ClientError
 
-bucket_name = f"testbucket-{int(time.time())}"  # This adds a timestamp to make it unique
+# Initialize S3 and DynamoDB client server
+s3_client = boto3.client('s3')
+dynamodb_client = boto3.resource('dynamodb')
 
-s3 = boto3.client('s3')
+# S3 bucket name
+bucket_name = 'testbucket-zhou'
 
+# DynamoDB table name
+table_name = 'S3-object-size-history03'
+
+
+## Part 1: Create a S3 bucket and a DynamoDB table
+# Create S3 bucket
 def create_s3_bucket():
     try:
-        s3.create_bucket(Bucket=bucket_name)
+        s3_client.create_bucket(Bucket=bucket_name)
         print(f"S3 bucket '{bucket_name}' created.")
     except Exception as e:
         print(f"Error creating bucket: {e}")
 
+
 create_s3_bucket()
 
-table_name = 'S3-object-size-history01'
-
+# Create DynamoDB table
 def create_dynamodb_table():
     try:
-        existing_tables = dynamodb.tables.all()
-        if table_name not in [table.name for table in existing_tables]:
-            table = dynamodb.create_table(
-                TableName=table_name,
-                KeySchema=[
-                    {'AttributeName': 'BucketName', 'KeyType': 'HASH'},  # Partition key
-                    {'AttributeName': 'Timestamp', 'KeyType': 'RANGE'}  # Sort key
-                ],
-                AttributeDefinitions=[
-                    {'AttributeName': 'BucketName', 'AttributeType': 'S'},
-                    {'AttributeName': 'Timestamp', 'AttributeType': 'S'}
-                ],
-                ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
-            )
-            table.wait_until_exists()
-            print(f"DynamoDB table '{table_name}' created.")
-        else:
-            print(f"Table '{table_name}' already exists.")
-    except Exception as e:
-        print(f"Error creating table: {e}")
+        response = dynamodb_client.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {
+                    'AttributeName': 'bucket_name',
+                    'KeyType': 'HASH'  # Partition key
+                },
+                {
+                    'AttributeName': 'timestamp',
+                    'KeyType': 'RANGE'  # Sort key
+                }
+            ],
+            AttributeDefinitions=[
+                {
+                    'AttributeName': 'bucket_name',
+                    'AttributeType': 'S'  # String
+                },
+                {
+                    'AttributeName': 'timestamp',
+                    'AttributeType': 'S'  # Number (for epoch timestamp)
+                }
+            ],
+            ProvisionedThroughput={
+                'ReadCapacityUnits': 5,
+                'WriteCapacityUnits': 5
+            }
+        )
+        print(f"DynamoDB table '{table_name}' created successfully.")
+    except ClientError as e:
+        print(f"Error creating DynamoDB table: {e}")
+        return None
+    return response
+
+create_dynamodb_table()
 
 
-# Lambda function: size-tracking
+# size-tracking
 import boto3
 import time
 
@@ -51,14 +72,13 @@ import time
 s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
 
-
 def lambda_handler(event, context):
-    bucket_name = 'testbucket-1729236050'
-    table_name = 'S3-object-size-history'
+    bucket_name = 'testbucket-zhou'
+    table_name = 'S3-object-size-history03'
     table = dynamodb.Table(table_name)
 
     # List objects in the S3 bucket
-    response = s3.list_objects_v2(Bucket=bucket_name)
+    response = s3.list_objects_v2(Bucket = bucket_name)
     total_size = 0
     object_count = 0
 
@@ -70,10 +90,10 @@ def lambda_handler(event, context):
     timestamp = str(time.time())
     table.put_item(
         Item={
-            'BucketName': bucket_name,
-            'Timestamp': timestamp,
-            'Size': total_size,
-            'ObjectCount': object_count
+            'bucket_name': bucket_name,  # Fixed the key name to match DynamoDB schema
+            'timestamp': timestamp,
+            'size': total_size,
+            'object_count': object_count
         }
     )
 
@@ -83,109 +103,178 @@ def lambda_handler(event, context):
     }
 
 
-# Lambda function: plotting
+# plotting
 import boto3
 import matplotlib.pyplot as plt
+import io
 import time
+import datetime
+import matplotlib.dates as mdates
 
-s3 = boto3.client('s3')
+# Initialize AWS clients
 dynamodb = boto3.resource('dynamodb')
+s3_client = boto3.client('s3')
+
+# Constants
+BUCKET_NAME = 'testbucket-zhou'
+TABLE_NAME = 'S3-object-size-history03'
+
 
 
 def lambda_handler(event, context):
-    bucket_name = 'testbucket-1729236050t'
-    table = dynamodb.Table('S3-object-size-history')
+    table = dynamodb.Table(TABLE_NAME)
 
-    # Query DynamoDB for the last 10 seconds
-    current_time = time.time()
-    start_time = str(current_time - 10)
+    # Get the current time and calculate the time 10 seconds ago as strings
+    now = str(time.time())  # Current timestamp as string with decimal
+    ten_seconds_ago = str(float(now) - 10)  # Subtract 10 seconds, convert to string
 
+    # Query DynamoDB for items in the last 10 seconds (stored as strings)
     response = table.query(
-        KeyConditionExpression=boto3.dynamodb.conditions.Key('BucketName').eq(bucket_name) &
-                               boto3.dynamodb.conditions.Key('Timestamp').between(start_time, str(current_time))
+        KeyConditionExpression=boto3.dynamodb.conditions.Key('bucket_name').eq(BUCKET_NAME) &
+                               boto3.dynamodb.conditions.Key('timestamp').between(ten_seconds_ago, now)
+    )
+    # Extract the relevant data for plotting
+    items = response['Items']
+
+    # Convert string timestamps back to float and convert them to datetime objects for better plotting
+    timestamps = [datetime.datetime.fromtimestamp(float(item['timestamp'])) for item in items]
+    sizes = [int(item['size']) for item in items]
+
+    # Query the maximum bucket size from the whole table
+    response_max = table.query(
+        KeyConditionExpression=boto3.dynamodb.conditions.Key('bucket_name').eq(BUCKET_NAME),
+        ProjectionExpression='size',
+        Limit=1,  # Get only one item (maximum size)
+        ScanIndexForward=False  # Sort descending to get the largest size
     )
 
-    items = response['Items']
-    timestamps = [float(item['Timestamp']) for item in items]
-    sizes = [item['Size'] for item in items]
+    # Check if max size exists
+    if response_max['Items']:
+        max_size = int(response_max['Items'][0]['size'])
+    else:
+        max_size = 0  # Default to 0 if no data
 
-    # Log the returned items from DynamoDB
-    print(f"Items retrieved from DynamoDB: {items}")
+    # Plotting using matplotlib
+    plt.figure(figsize=(10, 6))
+    plt.plot(timestamps, sizes, label='Bucket Size (last 10s)', marker='o')
 
-    # Check if there is any data to plot
-    if len(sizes) == 0 or len(timestamps) == 0:
-        print("No data found for plotting.")
-        return {
-            'statusCode': 400,
-            'body': 'No data found for plotting.'
-        }
+    # Formatting the x-axis for better readability
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))  # Formatting as HH:MM:SS
+    plt.gca().xaxis.set_major_locator(
+        mdates.SecondLocator(interval=1))  # Tick every second (you can change the interval)
 
-    # Generate the plot
-    plt.plot(timestamps, sizes, label='Bucket Size')
-    plt.axhline(max(sizes), color='red', linestyle='--', label='Max Size')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Size (bytes)')
+    # Limit the number of ticks on the y-axis
+    plt.gca().yaxis.set_major_locator(plt.MaxNLocator(integer=True, prune='both', nbins=10))  # Limit to 10 ticks
+    plt.axhline(y=max_size, color='r', linestyle='--', label=f'Max Size: {max_size} bytes')
+    plt.title('Bucket Size Changes (Last 10 Seconds)')
+    plt.xlabel('Time')
+    plt.ylabel('Size (Bytes)')
     plt.legend()
-    plt.savefig('/tmp/plot.png')
+
+    # Auto-rotate the x-axis labels for better readability
+    plt.gcf().autofmt_xdate()
+
+    # Save the plot to a buffer and upload to S3
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+
+    print("create plot")
 
     # Upload the plot to S3
-    with open('/tmp/plot.png', 'rb') as file:
-        s3.put_object(Bucket=bucket_name, Key='plot', Body=file)
+    plot_key = 'bucket_size_plot.png'
+    s3_client.put_object(Bucket=BUCKET_NAME, Key=plot_key, Body=buf, ContentType='image/png')
 
     return {
         'statusCode': 200,
-        'body': 'Plot generated and uploaded to S3.'
+        'body': f"Plot successfully generated and uploaded to S3 as {plot_key}."
     }
 
 
-# Lambda function: driver
+# driver
 import boto3
 import time
 import urllib3
 
-# Initialize AWS clients
-s3 = boto3.client('s3')
-http = urllib3.PoolManager()
+# Initialize S3 and Lambda clients
+s3_client = boto3.client('s3')
+lambda_client = boto3.client('lambda')
+bucket_name = 'testbucket-zhou'
+
+
+def empty_bucket(bucket_name):
+    """
+    Function to empty the given S3 bucket by deleting all objects.
+    """
+    try:
+        # List all objects in the bucket
+        response = s3_client.list_objects_v2(Bucket=bucket_name)
+
+        if 'Contents' in response:
+            # Collect the object keys to delete
+            objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+
+            # Perform the bulk delete
+            delete_response = s3_client.delete_objects(
+                Bucket=bucket_name,
+                Delete={'Objects': objects_to_delete}
+            )
+            print(f"Deleted objects: {delete_response}")
+        else:
+            print(f"No objects to delete in {bucket_name}")
+
+    except Exception as e:
+        print(f"Error occurred while emptying bucket {bucket_name}: {str(e)}")
+        raise e
 
 
 def lambda_handler(event, context):
-    bucket_name = 'testbucket-1729236050'
+    empty_bucket(bucket_name)
+    # 1. Create object 'assignment1.txt' with content "Empty Assignment 1"
+    time.sleep(1)
+    s3_client.put_object(Bucket=bucket_name, Key='assignment1.txt', Body='Empty Assignment 1')
+    print("Created assignment1.txt with content 'Empty Assignment 1' (size: 19 bytes)")
 
-    # Step 1: Create a new object in the S3 bucket
-    s3.put_object(Bucket=bucket_name, Key='assignment1.txt', Body='Empty Assignment 1')
-    print("Created assignment1.txt in S3 bucket.")
-    time.sleep(5)  # Wait for 5 seconds to simulate time between operations
+    # Wait for 1 second so that data points won't be too close
+    time.sleep(1)
 
-    # Step 2: Update the object with new content
-    s3.put_object(Bucket=bucket_name, Key='assignment1.txt', Body='Empty Assignment 2222222222')
-    print("Updated assignment1.txt in S3 bucket.")
-    time.sleep(5)  # Wait for 5 seconds
+    # 2. Update object 'assignment1.txt' with content "Empty Assignment 2222222222"
+    s3_client.put_object(Bucket=bucket_name, Key='assignment1.txt', Body='Empty Assignment 2222222222')
+    print("Updated assignment1.txt with content 'Empty Assignment 2222222222' (size: 28 bytes)")
 
-    # Step 3: Delete the object from the bucket
-    s3.delete_object(Bucket=bucket_name, Key='assignment1.txt')
-    print("Deleted assignment1.txt from S3 bucket.")
-    time.sleep(5)  # Wait for 5 seconds
+    # Wait for 1 second
+    time.sleep(1)
 
-    # Step 4: Create another object in the bucket
-    s3.put_object(Bucket=bucket_name, Key='assignment2.txt', Body='33')
-    print("Created assignment2.txt in S3 bucket.")
-    time.sleep(5)  # Wait for 5 seconds
+    # 3. Delete object 'assignment1.txt'
+    s3_client.delete_object(Bucket=bucket_name, Key='assignment1.txt')
+    print("Deleted assignment1.txt (size: 0 bytes)")
 
-    # Step 5: Call the Plotting Lambda via API Gateway
-    plotting_lambda_api_url = 'https://mbrls81nt8.execute-api.us-east-1.amazonaws.com/default/plotting'
-    response = http.request('GET', plotting_lambda_api_url)
+    # Wait for 1 second
+    time.sleep(1)
 
-    # Log the response from the Plotting Lambda
-    print(f"Plotting Lambda API response status: {response.status}")
-    print(f"Plotting Lambda API response body: {response.data.decode('utf-8')}")
+    # 4. Create object 'assignment2.txt' with content "33"
+    s3_client.put_object(Bucket=bucket_name, Key='assignment2.txt', Body='33')
+    print("Created assignment2.txt with content '33' (size: 2 bytes)")
 
-    # Return success message
-    return {
-        'statusCode': response.status,
-        'body': response.data.decode('utf-8')
-    }
+    # 5. Invoke the plotting lambda function to generate the plot
+    api_url = "https://9kfe5llytd.execute-api.us-east-1.amazonaws.com/default/"
+    http = urllib3.PoolManager()
+    response = http.request('GET', api_url)
 
+    try:
+        response = http.request('GET', api_url)
+        print(f"API call response status: {response.status}")
+        print(f"API call response data: {response.data.decode('utf-8')}")
 
-
-
+        # Return the result of invoking the plotting lambda
+        return {
+            'statusCode': 200,
+            'body': f'Driver Lambda executed successfully. Plotting Lambda invoked via API: {response.status}'
+        }
+    except Exception as e:
+        print(f"Error occurred while calling plotting lambda: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': f'Error invoking plotting lambda: {str(e)}'
+        }
 
